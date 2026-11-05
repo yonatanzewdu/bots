@@ -38,9 +38,9 @@ const SERVER_URL   = (process.env.SERVER_URL || '').replace(/\/+$/, '');
 const ADMIN_TOKEN  = process.env.ADMIN_TOKEN;
 const BOTS         = parseInt(process.env.BOTS || '40', 10);
 const DEPOSIT      = parseInt(process.env.DEPOSIT || '10000', 10);
-const STAKE_ID     = process.env.STAKE || 'st10';
+let   STAKE_ID     = process.env.STAKE || 'st10';
 const CARDS        = Math.min(2, Math.max(1, parseInt(process.env.CARDS || '1', 10)));
-const STAKE_AMOUNT = STAKE_ID === 'st20' ? 20 : 10;
+let   STAKE_AMOUNT = STAKE_ID === 'st20' ? 20 : 10;
 const TOTAL_CARDS  = 400;
 
 // Reserved ID/phone ranges so test users never collide with real players
@@ -136,6 +136,9 @@ async function registerUsers() {
 // ─── BOT ─────────────────────────────────────────────────────
 const bots = [];
 let gamesSeen = 0;
+let serverStakes = null;          // stake list the server announces on connect
+let lastError = '';               // last unexpected server error, shown in the status line
+const seenErrors = new Set();
 let stopping = false;
 
 class Bot {
@@ -181,7 +184,17 @@ class Bot {
         break;
       case 'balanceUpdate': this.balance = m.balance; break;
       case 'depositSubmitted': this.depositOk = true; break;
+      case 'connected':
+        if (m.stakes && !serverStakes) {
+          serverStakes = m.stakes;
+          log(`ℹ️ Server stakes: ${m.stakes.map(x => `${x.stakeId}=${x.amount} ETB`).join(', ')}`);
+        }
+        break;
       case 'error':
+        if (!/already taken|Need .* ETB/i.test(m.message || '')) {
+          lastError = `${this.name}: ${m.message}`;
+          if (!seenErrors.has(m.message)) { seenErrors.add(m.message); log(`❗ Server error for ${this.name}: ${m.message}`); }
+        }
         if (/already taken/i.test(m.message)) { this.pendingPick = false; this.pick(); }
         else if (/Need .* ETB/i.test(m.message)) { this.pendingPick = false; this.outOfMoney(); }
         break;
@@ -268,7 +281,16 @@ class Bot {
     checkAllDone();
   }
 
-  join() { this.send({ type: 'joinRoom', stakeId: STAKE_ID }); }
+  join() {
+    if (serverStakes && !serverStakes.find(x => x.stakeId === STAKE_ID)) {
+      const first = serverStakes[0];
+      log(`⚠️ Stake "${STAKE_ID}" does not exist on this server. Using "${first.stakeId}" instead.`);
+      STAKE_ID = first.stakeId;
+    }
+    const st = serverStakes && serverStakes.find(x => x.stakeId === STAKE_ID);
+    if (st) STAKE_AMOUNT = st.amount;
+    this.send({ type: 'joinRoom', stakeId: STAKE_ID });
+  }
 }
 
 function activeBots() { return bots.filter(b => !b.done); }
@@ -281,7 +303,9 @@ function checkAllDone() {
 
 function summary() {
   const total = bots.reduce((s, b) => s + b.balance, 0);
-  log(`📊 games finished: ${gamesSeen} | active bots: ${activeBots().length}/${bots.length} | total bot balance: ${total.toFixed(0)} ETB`);
+  const inRoom = bots.filter(b => b.selecting || b.cards.length).length;
+  const holding = bots.filter(b => b.cards.length).length;
+  log(`📊 games finished: ${gamesSeen} | active: ${activeBots().length}/${bots.length} | in room: ${inRoom} | holding a card: ${holding} | total balance: ${total.toFixed(0)} ETB` + (lastError ? ` | last error: ${lastError}` : ''));
 }
 
 function finish(reason) {
@@ -305,18 +329,33 @@ async function depositAll() {
   log(`📨 ${sent}/${bots.length} deposit requests submitted`);
 
   const headers = { 'x-admin-token': ADMIN_TOKEN, 'Content-Type': 'application/json' };
-  const res = await fetch(`${SERVER_URL}/api/admin/deposits?status=pending`, { headers });
-  if (!res.ok) throw new Error(`Could not list deposits (HTTP ${res.status}). Check ADMIN_TOKEN.`);
-  const pending = (await res.json()).filter(d => String(d.tx_ref || '').startsWith('TESTBOT-'));
-  log(`🔎 found ${pending.length} pending test deposits to approve`);
-  for (const d of pending) {
-    await fetch(`${SERVER_URL}/api/admin/deposits/${d.id}/approve`, { method: 'POST', headers });
-    await sleep(50);
+
+  // Approve pending test deposits, then make sure every bot actually sees its balance.
+  // Retries a few times because approvals / balance pushes can land a little late.
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    const res = await fetch(`${SERVER_URL}/api/admin/deposits?status=pending`, { headers });
+    if (!res.ok) throw new Error(`Could not list deposits (HTTP ${res.status}). Check ADMIN_TOKEN.`);
+    const pending = (await res.json()).filter(d => String(d.tx_ref || '').startsWith('TESTBOT-'));
+    if (pending.length) log(`🔎 approving ${pending.length} pending test deposit(s) (attempt ${attempt})`);
+    for (const d of pending) {
+      await fetch(`${SERVER_URL}/api/admin/deposits/${d.id}/approve`, { method: 'POST', headers });
+      await sleep(50);
+    }
+    await sleep(2000);
+
+    // Ask the server for each unfunded bot's real balance (re-auth reads it from the DB)
+    const missing = bots.filter(b => b.balance < DEPOSIT);
+    if (!missing.length) break;
+    missing.forEach(b => b.send({ type: 'telegramAuth', telegramId: b.tid }));
+    await sleep(1500);
+    if (!bots.some(b => b.balance < DEPOSIT)) break;
   }
-  await sleep(2000);
   const funded = bots.filter(b => b.balance >= DEPOSIT).length;
   log(`💰 ${funded}/${bots.length} bots funded with ${DEPOSIT} ETB`);
-  if (funded < bots.length) log('⚠️ Some bots are not funded. The admin list only shows 50 pending deposits at a time; clear other pending deposits and rerun.');
+  const unfunded = bots.filter(b => b.balance < DEPOSIT);
+  if (unfunded.length) {
+    log(`⚠️ Not funded: ${unfunded.map(b => b.name).join(', ')}. They will sit out. Check their deposit rows in the admin panel or database.`);
+  }
 }
 
 // ─── MAIN ────────────────────────────────────────────────────
