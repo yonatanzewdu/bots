@@ -1,0 +1,16 @@
+{
+  "name": "bingo-testbots",
+  "version": "1.0.0",
+  "private": true,
+  "main": "testbots.js",
+  "scripts": {
+    "start": "node testbots.js"
+  },
+  "dependencies": {
+    "pg": "^8.11.0",
+    "ws": "^8.16.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
