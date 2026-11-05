@@ -136,6 +136,8 @@ async function registerUsers() {
 // ─── BOT ─────────────────────────────────────────────────────
 const bots = [];
 let gamesSeen = 0;
+let roundCards = 0;              // cards staked by the bots in the current round
+let lastGameLog = 0;
 let serverStakes = null;          // stake list the server announces on connect
 let lastError = '';               // last unexpected server error, shown in the status line
 const seenErrors = new Set();
@@ -224,15 +226,23 @@ class Bot {
         if (m.cardId) this.cards.push({ id: m.cardId, nums: m.cardNumbers, slot: 1 });
         if (m.cardId2) this.cards.push({ id: m.cardId2, nums: m.cardNumbers2, slot: 2 });
         this.games++;
+        roundCards += (m.cardId ? 1 : 0) + (m.cardId2 ? 1 : 0);
         break;
       case 'numberCalled':
         this.called = m.calledNumbers;
         this.autoClaim();
         break;
-      case 'gameOver':
-        gamesSeen++;
+      case 'gameOver': {
+        // Every bot in the room gets this message, so only log/count once per game
+        if (Date.now() - lastGameLog > 3000) {
+          lastGameLog = Date.now();
+          gamesSeen++;
+          log(`🎲 Game ${gamesSeen} finished | cards staked by bots: ${roundCards} (the Players box should show this) | ${m.message}`);
+          roundCards = 0;
+        }
         if (m.winners && m.winners.includes(this.name)) this.wins++;
         break;
+      }
       case 'disqualified': log(`🚫 ${this.name} disqualified (should not happen)`); break;
       case 'backToCardSelection':
         this.balance = m.balance;
